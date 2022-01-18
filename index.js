@@ -4,31 +4,32 @@ const mongoose = require('mongoose');
 const guildTicketSettings = require('./models/guildTicketSettings.js');
 const guildTickets = require('./models/guildTickets.js');
 
+//Must be called on startup - OTHER FUNCTIONS WILL WORK UNTIL THIS IS CALLED.
 async function initialise() {
 	try {
-		await mongoose.connect(process.env.MONGO_URL, {
+		mongoose.connect(process.env.MONGO_URL, {
 			useNewUrlParser: true,
 			useUnifiedTopology: true,
 		});
 
 		console.log('[TICKETS] Initialised sucessfully!');
+		return true;
 	}
 	catch (error) {
 		console.error('[TICKETS] Failed to connect to the database!', error);
+		return false;
 	}
 }
 
-async function open(interaction, ticketReasonID) {
-	let ticketSettings, ticketReason, OpenCategory;
-
-	await interaction.deferReply({ ephemeral: true });
+async function getGuildSettings(guild) {
+	let ticketSettings;
 
 	//Get guildTicketSettings from database if it exists, else generate a new one.
 	try {
-		ticketSettings = await guildTicketSettings.findOne({ guildID: interaction.guild.id });
+		ticketSettings = await guildTicketSettings.findOne({ guildID: guild.id });
 		if (!ticketSettings) {
 			const guildSetup = new guildTicketSettings({
-				guildID: interaction.guild.id,
+				guildID: guild.id,
 				guildEmbedTitle: 'Create a Ticket!',
 				guildEmbedDescription: 'Press a button below to open a ticket!',
 				guildEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
@@ -50,43 +51,49 @@ async function open(interaction, ticketReasonID) {
 			await guildSetup.save();
 			ticketSettings = guildSetup;
 		}
+		return ticketSettings;
 	}
 	catch (error) {
-		console.error(error);
+		console.log(error);
 	}
+}
+
+async function open(guild, user, ticketReasonID) {
+	let ticketReason, OpenCategory, newChannel;
+
+	const ticketSettings = await getGuildSettings(guild);
 
 	//Find staff role as specified in the database, if not found return and inform user.
-	const staffRole = await interaction.guild.roles.cache.find(
+	const staffRole = await guild.roles.cache.find(
 		role => role.name === ticketSettings.guildStaffRoleName,
 	);
 
-	if (!staffRole) return await interaction.editReply({ content: 'This panel has been setup incorrectly! Please contact a staff member.', ephemeral: true });
+	if (!staffRole) return 'No staff role';
 
 	//Set reason for ticket message.
 	switch (ticketReasonID)	{
-	case '1':
+	case 1:
 		ticketReason = ticketSettings.guildTicketReason1;
 		break;
-	case '2':
+	case 2:
 		ticketReason = ticketSettings.guildTicketReason2;
 		break;
-	case '3':
+	case 3:
 		ticketReason = ticketSettings.guildTicketReason3;
 		break;
-	case '4':
+	case 4:
 		ticketReason = ticketSettings.guildTicketReason4;
 		break;
-	case '5':
+	case 5:
 		ticketReason = ticketSettings.guildTicketReason5;
 		break;
 	default:
-		return await interaction.editReply({ content: 'This interaction is linked to an invalid ticket type!', ephemeral: true });
+		return 'Invalid ticketReasonID provided';
 	}
 
-	//Begin opening ticket with informing user and creating embed & close button.
-	await interaction.editReply({ content: 'Creating a ticket....', ephemeral: true });
+	//Begin opening ticket and creating embed & close button.
 	const ticketEmbed = new MessageEmbed()
-		.setTitle(`${interaction.user.username} - ${ticketReason}`)
+		.setTitle(`${user.username} - ${ticketReason}`)
 		.setDescription(ticketSettings.guildTicketOpenEmbedDescription)
 		.setFooter({ text: ticketSettings.guildTicketEmbedFooterText })
 		.setColor('RANDOM');
@@ -102,32 +109,33 @@ async function open(interaction, ticketReasonID) {
 
 	//Find open category specified in DB, or inform user it does not exist if it is not found.
 	try {
-		OpenCategory = interaction.guild.channels.cache.find(c => c.name === ticketSettings.guildOpenCategory);
+		OpenCategory = guild.channels.cache.find(c => c.name === ticketSettings.guildOpenCategory);
 	}
 	catch {
-		return await interaction.editReply({ content: 'Could not find the specified parent category, please contact a staff member!', ephemeral: true });
+		return 'Parent not found';
 	}
 
 	//Check if user already has a ticket in DB.
 	try {
-		const query = await guildTickets.find({ 'authorId': { $in:'tickets' } });
+		const query = await guildTickets.find({ guildID: guild.id, 'tickets.authorID':  user.id });
 		if (query.length !== 0) {
-			return await interaction.editReply({ content: 'You already have an open ticket. Please close it before making a new one!' });
+			return 'Already has ticket';
 		}
 	}
 	catch (error) {
 		console.error(error);
+		return 'Could not fetch ticket ownership status';
 	}
 
-	await interaction.guild.channels.create(`ticket-${interaction.user.username}`, {
+	await guild.channels.create(`ticket-${user.username}`, {
 		parent: OpenCategory,
 		permissionOverwrites: [
 			{
-				id: interaction.user.id,
+				id: user.id,
 				allow: ['SEND_MESSAGES', 'VIEW_CHANNEL'],
 			},
 			{
-				id: interaction.guild.roles.everyone,
+				id: guild.roles.everyone,
 				deny: ['VIEW_CHANNEL'],
 			},
 			{
@@ -136,22 +144,22 @@ async function open(interaction, ticketReasonID) {
 			},
 		],
 		type: 'text',
-		topic: interaction.user.id,
+		topic: user.id,
 		reason: 'Ticket Creation',
 	}).then(async channel => {
-		channel.send({ content: `<@${interaction.user.id}> ${ticketSettings.guildTicketOpenMessage}`, embeds: [ticketEmbed], components: [closeTicketButton] });
-		await interaction.editReply({ content: `Sucessfully created a ticket: ${channel}!`, ephemeral: true });
+		newChannel = channel.id;
+		channel.send({ content: `<@${user.id}> ${ticketSettings.guildTicketOpenMessage}`, embeds: [ticketEmbed], components: [closeTicketButton] });
 
 		//Create new ticket log.
 		const ticket = {
-			authorID: interaction.member.id,
+			authorID: user.id,
 			channelID: channel.id,
 		};
 
 		//Add new ticket log to DB.
 		try {
 			await guildTickets.findOneAndUpdate({
-				guildId: interaction.guild.id,
+				guildID: guild.id,
 			},
 			{
 				$push: {
@@ -164,48 +172,120 @@ async function open(interaction, ticketReasonID) {
 		}
 		catch (error) {
 			console.log(error);
+			return 'Failed to save ticket to DB';
 		}
 	});
 
+	return newChannel;
 }
 
-async function setup(interaction, channelID) {
-	let ticketSettings;
+async function close(channel, guild, member, client) {
 
-	await interaction.deferReply({ ephemeral: true });
+	//Check channel is a ticket.
+	if (!channel.name.includes('ticket-')) return 'Not an open ticket';
+	let staffRole;
 
-	//Get guildTicketSettings from database if it exists, else generate a new one.
-	try {
-		ticketSettings = await guildTicketSettings.findOne({ guildID: interaction.guild.id });
-		if (!ticketSettings) {
-			const guildSetup = new guildTicketSettings({
-				guildID: interaction.guild.id,
-				guildEmbedTitle: 'Create a Ticket!',
-				guildEmbedDescription: 'Press a button below to open a ticket!',
-				guildEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
-				guildEmbedColour: 'GREY',
-				guildTicketReason1: 'General Support',
-				guildTicketReason2: 'Appeal Support',
-				guildTicketReason3: 'Billing Support',
-				guildTicketReason4: '',
-				guildTicketReason5: '',
-				guildStaffRoleName: 'Staff',
-				guildTicketOpenMessage: '',
-				guildTicketOpenEmbedDescription: 'Please begin writing your query, a member of staff will respond soon!',
-				guildTicketEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
-				guildOpenCategory: 'Tickets',
-				guildTranscript: true,
-				guildTranscriptLogChannel: '',
-			});
+	const ticketSettings = await getGuildSettings(guild);
 
-			await guildSetup.save();
-			ticketSettings = guildSetup;
+	//Create & send/log transcript.
+	if (ticketSettings.guildTranscript === true) {
+
+		const transcript = await discordTranscripts.createTranscript(channel);
+
+		const ticketClosedEmbed = new MessageEmbed()
+			.setTitle('Ticket Closed')
+			.setDescription(`Ticket created by: <@${channel.topic}>\n Ticket closed by: ${member}\n Ticket name: ${channel.name}`)
+			.setFooter({ text: ticketSettings.guildTicketEmbedFooterText })
+			.setColor('RANDOM');
+
+		try {
+			const ticketOwner = guild.members.cache.get(channel.topic);
+			await ticketOwner.send({ content: `Thank you for contacting ${guild.name} support! A copy of the chat transcript can be downloaded below.`, files: [transcript] });
+		}
+		catch (error) {
+			if (!error === 'Cannot read properties of undefined (reading \'send\')') {
+				console.error(error);
+			}
+		}
+
+		try {
+			const c = await client.channels.fetch(ticketSettings.guildTranscriptLogChannel);
+			c.send({ embeds: [ticketClosedEmbed], files: [transcript] });
+		}
+		catch (error) {
+			await channel.send({ content: 'Could not log transcript! Have you set a transcript log channel? The transcript has been attached below', files: [transcript] }).catch(() => { return 'Could not log transcript'; });
 		}
 	}
-	catch (error) {
-		console.log(error);
-		return await interaction.editReply({ content: `An error has occured: ${error}`, ephemeral: true });
+
+	try {
+		staffRole = await guild.roles.cache.find(
+			role => role.name === ticketSettings.guildStaffRoleName,
+		);
 	}
+	catch (error) {
+		console.error(error);
+	}
+
+	//Change ticket to closed in channel name and remove creators permissions.
+	const newChannelName = channel.name.replace('ticket', 'closed');
+	try {
+		await channel.edit({
+			permissionOverwrites: [
+				{
+					id: channel.topic,
+					null: ['SEND_MESSAGES', 'VIEW_CHANNEL'],
+				},
+				{
+					id: guild.roles.everyone,
+					deny: ['VIEW_CHANNEL'],
+				},
+				{
+					id: staffRole,
+					allow: ['SEND_MESSAGES', 'VIEW_CHANNEL'],
+					deny: ['MANAGE_MESSAGES'],
+				},
+			],
+			name: newChannelName,
+			reason: 'Ticket Closed',
+		});
+	}
+	catch (error) {
+		console.error(error);
+	}
+
+	//Delete ticket from DB
+	try {
+		await guildTickets.updateOne({ guildID: guild.id }, { $pull: { 'tickets': { authorID: channel.topic } } });
+		return 'Success';
+	}
+	catch (error) {
+		console.error(error);
+		return 'Failed to edit DB';
+	}
+}
+
+async function deleteTicket(channel) {
+
+	//If ticket is not a closed ticket return with error message.
+	try {
+		if (!channel.name.includes('closed-')) return 'Not a closed ticket';
+	}
+	catch {
+		return 'Probably deleted';
+	}
+
+	try {
+		await channel.delete('Ticket Deleted');
+		return 'Success';
+	}
+	catch {
+		return 'Failed to delete';
+	}
+}
+
+async function setup(guild, channelID) {
+
+	const ticketSettings = await getGuildSettings(guild);
 
 	//Begin creating open ticket buttons, add button if value found in DB.
 	let atLeast1Button = false;
@@ -257,7 +337,7 @@ async function setup(interaction, channelID) {
 	}
 	//If no buttons were added return error message.
 	if (atLeast1Button === false) {
-		return await interaction.editReply({ content: 'This panel has no buttons assigned. Please add one or more before creating a panel.' });
+		return 'No reasons';
 	}
 
 	//Construct panel.
@@ -269,379 +349,170 @@ async function setup(interaction, channelID) {
 
 	//Find channel, then clear it of messages then send panel with open buttons.
 	try {
-		const channel = interaction.guild.channels.cache.find(c => c.id === channelID);
+		const channel = guild.channels.cache.find(c => c.id === channelID);
 		await channel.bulkDelete(100);
 		await channel.send({ embeds: [panel], components: [openTicketButtons] });
-		await interaction.editReply({ content:'Ticket panel created!', ephemeral: true });
+		return 'Ticket panel created';
 	}
 	catch (error) {
 		console.log(error);
-		return await interaction.editReply({ content:`Error creating ticket panel: ${error}`, ephemeral: true });
+		return 'Error creating ticket panel';
 	}
 }
 
-async function editSettings(interaction, option, value) {
-
-	let ticketSettings;
-
-	await interaction.deferReply({ ephemeral: true });
-
-	//Get guildTicketSettings from database if it exists, else generate a new one.
-	try {
-		ticketSettings = await guildTicketSettings.findOne({ guildID: interaction.guild.id });
-		if (!ticketSettings) {
-			const guildSetup = new guildTicketSettings({
-				guildID: interaction.guild.id,
-				guildEmbedTitle: 'Create a Ticket!',
-				guildEmbedDescription: 'Press a button below to open a ticket!',
-				guildEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
-				guildEmbedColour: 'GREY',
-				guildTicketReason1: 'General Support',
-				guildTicketReason2: 'Appeal Support',
-				guildTicketReason3: 'Billing Support',
-				guildTicketReason4: '',
-				guildTicketReason5: '',
-				guildStaffRoleName: 'Staff',
-				guildTicketOpenMessage: '',
-				guildTicketOpenEmbedDescription: 'Please begin writing your query, a member of staff will respond soon!',
-				guildTicketEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
-				guildOpenCategory: 'Tickets',
-				guildTranscript: true,
-				guildTranscriptLogChannel: '',
-			});
-
-			await guildSetup.save();
-			ticketSettings = guildSetup;
-		}
-	}
-	catch (error) {
-		console.error(error);
-	}
-
+async function editSettings(guild, option, value) {
 
 	if (option === 'paneltitle') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildEmbedTitle: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildEmbedTitle: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'paneldescription') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildEmbedDescription: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildEmbedDescription: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'embedfooter') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildEmbedFooterText: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildEmbedFooterText: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'embedcolour') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildEmbedColour: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildEmbedColour: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'reason1') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildTicketReason1: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildTicketReason1: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'reason2') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildTicketReason2: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildTicketReason2: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'reason3') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildTicketReason3: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildTicketReason3: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'reason4') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildTicketReason4: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildTicketReason4: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'reason5') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildTicketReason5: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildTicketReason5: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'staffrole') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildStaffRoleName: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildStaffRoleName: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'ticketopenmessage') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildTicketOpenMessage: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildTicketOpenMessage: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'ticketopenembed') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildTicketOpenEmbedDescription: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildTicketOpenEmbedDescription: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'ticketopenembedfooter') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildTicketEmbedFooterText: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildTicketEmbedFooterText: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'opencategory') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildOpenCategory: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildOpenCategory: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'transcript') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildTranscript: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildTranscript: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 	else if (option === 'transcriptlogchannel') {
 		try {
-			await guildTicketSettings.updateOne({ guildID: interaction.guild.id }, { $set: { guildTranscriptLogChannel: value } });
+			await guildTicketSettings.updateOne({ guildID: guild.id }, { $set: { guildTranscriptLogChannel: value } });
 		}
 		catch (error) {
 			console.log(error);
-			return await interaction.editReply({ content: 'Could not add new value to the database!' });
+			return 'Could not update database';
 		}
 	}
 
-	//Finally
-	await interaction.editReply({ content: 'Success! Settings have been updated sucessfully, please remember to remake the panel if you have updated it.' });
-}
-
-async function close(interaction, client) {
-
-	await interaction.deferReply();
-
-	//Check channel is a ticket.
-	if (!interaction.channel.name.includes('ticket-')) return interaction.editReply({ content: 'This is not an open ticket! Has it already been closed?' });
-	let ticketSettings, staffRole;
-
-	//Get guildTicketSettings from database if it exists, else generate a new one.
-	try {
-		ticketSettings = await guildTicketSettings.findOne({ guildID: interaction.guild.id });
-		if (!ticketSettings) {
-			const guildSetup = new guildTicketSettings({
-				guildID: interaction.guild.id,
-				guildEmbedTitle: 'Create a Ticket!',
-				guildEmbedDescription: 'Press a button below to open a ticket!',
-				guildEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
-				guildEmbedColour: 'GREY',
-				guildTicketReason1: 'General Support',
-				guildTicketReason2: 'Appeal Support',
-				guildTicketReason3: 'Billing Support',
-				guildTicketReason4: '',
-				guildTicketReason5: '',
-				guildStaffRoleName: 'Staff',
-				guildTicketOpenMessage: '',
-				guildTicketOpenEmbedDescription: 'Please begin writing your query, a member of staff will respond soon!',
-				guildTicketEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
-				guildOpenCategory: 'Tickets',
-				guildTranscript: true,
-				guildTranscriptLogChannel: '',
-			});
-
-			await guildSetup.save();
-			ticketSettings = guildSetup;
-		}
-	}
-	catch (error) {
-		console.error(error);
-	}
-
-	//Create & send/log transcript.
-	if (ticketSettings.guildTranscript === true) {
-
-		const transcriptChannel = interaction.channel;
-		const ticketOwnerID = interaction.channel.topic;
-		const transcript = await discordTranscripts.createTranscript(transcriptChannel);
-
-		const ticketClosedEmbed = new MessageEmbed()
-			.setTitle('Ticket Closed')
-			.setDescription(`Ticket created by: <@${ticketOwnerID}>\n Ticket closed by: ${interaction.member}\n Ticket name: ${interaction.channel.name}`)
-			.setFooter({ text: ticketSettings.guildTicketEmbedFooterText })
-			.setColor('RANDOM');
-
-		try {
-			const ticketOwner = interaction.guild.members.cache.get(interaction.channel.topic);
-			await ticketOwner.send({ content: `Thank you for contacting ${interaction.guild.name} support! A copy of the chat transcript can be downloaded below.`, files: [transcript] });
-		}
-		catch (error) {
-			console.error(error);
-		}
-
-		try {
-			const c = await client.channels.fetch(ticketSettings.guildTranscriptLogChannel);
-			c.send({ embeds: [ticketClosedEmbed], files: [transcript] });
-		}
-		catch (error) {
-			await interaction.channel.send({ content: 'Could not log transcript! Have you set a transcript log channel? The transcript has been attached below', files: [transcript] }).catch((e) => { return interaction.editReply({ content: `An error has occured: ${e}` }); });
-		}
-	}
-
-	try {
-		staffRole = await interaction.guild.roles.cache.find(
-			role => role.name === ticketSettings.guildStaffRoleName,
-		);
-	}
-	catch (error) {
-		console.error(error);
-	}
-
-	//Change ticket to closed in channel name and remove creators permissions.
-	const newChannelName = interaction.channel.name.replace('ticket', 'closed');
-	try {
-		await interaction.channel.edit({
-			permissionOverwrites: [
-				{
-					id: interaction.channel.topic,
-					null: ['SEND_MESSAGES', 'VIEW_CHANNEL'],
-				},
-				{
-					id: interaction.guild.roles.everyone,
-					deny: ['VIEW_CHANNEL'],
-				},
-				{
-					id: staffRole,
-					allow: ['SEND_MESSAGES', 'VIEW_CHANNEL'],
-					deny: ['MANAGE_MESSAGES'],
-				},
-			],
-			name: newChannelName,
-			reason: 'Ticket Closed',
-		});
-	}
-	catch (error) {
-		console.error(error);
-	}
-
-	//Delete ticket from DB
-	try {
-		await guildTickets.deleteMany({ authorId: { authorId: interaction.member.id } });
-	}
-	catch (error) {
-		console.error(error);
-	}
-
-	//Create and send closed Embed & buttons.
-	const closedTicketEmbed = new MessageEmbed()
-		.setTitle('Ticket Closed')
-		.setDescription(`Ticket closed by ${interaction.user.tag}`)
-		.setFooter({ text: ticketSettings.guildTicketEmbedFooterText })
-		.setColor('RANDOM');
-
-	const closedTicketOptionsButton = new MessageActionRow()
-		.addComponents(
-			new MessageButton()
-				.setCustomId('deleteTicket')
-				.setLabel('Delete')
-				.setEmoji('⛔')
-				.setStyle('DANGER'),
-		)
-		.addComponents(
-			new MessageButton()
-				.setCustomId('reopenTicket')
-				.setLabel('Re-Open')
-				.setEmoji('🔓')
-				.setStyle('SECONDARY'),
-		);
-
-	await interaction.editReply({ embeds: [closedTicketEmbed], components: [closedTicketOptionsButton] });
+	return 'Settings updated sucessfully';
 }
 
 async function alertOwner(message) {
-	let ticketSettings;
 
-	//Get guildTicketSettings from database if it exists, else generate a new one.
-	try {
-		ticketSettings = await guildTicketSettings.findOne({ guildID: message.guild.id });
-		if (!ticketSettings) {
-			const guildSetup = new guildTicketSettings({
-				guildID: message.guild.id,
-				guildEmbedTitle: 'Create a Ticket!',
-				guildEmbedDescription: 'Press a button below to open a ticket!',
-				guildEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
-				guildEmbedColour: 'GREY',
-				guildTicketReason1: 'General Support',
-				guildTicketReason2: 'Appeal Support',
-				guildTicketReason3: 'Billing Support',
-				guildTicketReason4: '',
-				guildTicketReason5: '',
-				guildStaffRoleName: 'Staff',
-				guildTicketOpenMessage: '',
-				guildTicketOpenEmbedDescription: 'Please begin writing your query, a member of staff will respond soon!',
-				guildTicketEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
-				guildOpenCategory: 'Tickets',
-				guildTranscript: true,
-				guildTranscriptLogChannel: '',
-			});
-
-			await guildSetup.save();
-			ticketSettings = guildSetup;
-		}
-	}
-	catch (error) {
-		console.error(error);
-	}
+	const ticketSettings = await getGuildSettings(message.guild);
 
 	//If not a ticket channel return.
 	if (!message.channel.name.includes('ticket-')) return;
@@ -650,85 +521,43 @@ async function alertOwner(message) {
 	if (message.author.id === message.channel.topic || message.author.bot || !message.member.roles.cache.find(role => role.name === ticketSettings.guildStaffRoleName)) return;
 
 	//Ping ticket owner then delete.
-	message.channel.send(`A new reply has been added to your ticket <@${message.channel.topic}>`).then(msg => {
-		setTimeout(() => msg.delete(), 100);
-	});
-
-
-}
-
-async function deleteTicket(interaction) {
-
-	await interaction.deferReply();
-
-	//If ticket is not a closed ticket return with error message.
-	if (!interaction.channel.name.includes('closed-')) return await interaction.editReply({ content: 'This is not a closed ticket!' });
-
-	//Else delete ticket after 5 seconds.
-	interaction.message.delete().then(() => {
-		interaction.editReply({ content: 'Deleting ticket in 5 seconds!' }).then(() => {
-			setTimeout(async () => {
-				if (!interaction.channel.name.includes('closed-')) return await interaction.editReply({ content: 'Ticket deletion canceled!' });
-				interaction.channel.delete('Deleting Ticket');
-			}, 5000);
+	try {
+		message.channel.send(`A new reply has been added to your ticket <@${message.channel.topic}>`).then(msg => {
+			setTimeout(() => msg.delete(), 100);
 		});
-	});
+		return 'success';
+	}
+	catch (error) {
+		return error;
+	}
 }
 
 async function removeDBTicket(channel) {
 
-	if (!channel.name.includes('ticket-')) return;
-
-	let ticketSettings;
-
-	//Get guildTicketSettings from database if it exists, else generate a new one.
 	try {
-		ticketSettings = await guildTicketSettings.findOne({ guildID: channel.guild.id });
-		if (!ticketSettings) {
-			const guildSetup = new guildTicketSettings({
-				guildID: channel.guild.id,
-				guildEmbedTitle: 'Create a Ticket!',
-				guildEmbedDescription: 'Press a button below to open a ticket!',
-				guildEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
-				guildEmbedColour: 'GREY',
-				guildTicketReason1: 'General Support',
-				guildTicketReason2: 'Appeal Support',
-				guildTicketReason3: 'Billing Support',
-				guildTicketReason4: '',
-				guildTicketReason5: '',
-				guildStaffRoleName: 'Staff',
-				guildTicketOpenMessage: '',
-				guildTicketOpenEmbedDescription: 'Please begin writing your query, a member of staff will respond soon!',
-				guildTicketEmbedFooterText: 'Discord Ticket System - Created by RaulTechSupport',
-				guildOpenCategory: 'Tickets',
-				guildTranscript: true,
-				guildTranscriptLogChannel: '',
-			});
-
-			await guildSetup.save();
-			ticketSettings = guildSetup;
-		}
+		if (!channel.name.includes('ticket-')) return;
 	}
 	catch (error) {
-		console.error(error);
+		return error;
 	}
-
 
 	//Delete ticket from DB
 	try {
-		await guildTickets.deleteMany({ authorId: { authorId: channel.topic } });
+		await guildTickets.updateOne({ guildID: channel.guild.id }, { $pull: { 'tickets': { authorID: channel.topic } } });
+		return 'Success';
 	}
 	catch (error) {
 		console.error(error);
+		return error;
 	}
 
 }
 
 module.exports.initialise = initialise;
 module.exports.open = open;
+module.exports.close = close;
+module.exports.deleteTicket = deleteTicket;
 module.exports.setup = setup;
 module.exports.editSettings = editSettings;
-module.exports.close = close;
 module.exports.alertOwner = alertOwner;
-module.exports.deleteTicket = deleteTicket;
 module.exports.removeDBTicket = removeDBTicket;

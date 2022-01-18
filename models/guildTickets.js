@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 const GuildTicketsSchema = new mongoose.Schema({
-	guildId: {
+	guildID: {
 		type: String,
 		required: true,
 	},
